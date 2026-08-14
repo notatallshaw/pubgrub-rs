@@ -54,10 +54,11 @@
 //!
 //! The second bound is the type of package requirements. It can be anything that implements our [VersionSet] trait.
 //! This trait is used to figure out how version requirements are combined.
-//! If the normal [Ord]/[PartialEq] operations are all that is needed for requirements, our [Ranges] type will work.
+//! If requirements are ordinary ranges over an ordered, hashable version type, our [Ranges] type will work.
 //!
 //! The chosen `VersionSet` in turn specifies what can be used for version numbers.
 //! This type needs to at least implement [Clone] + [Ord] + [Debug] + [Display](std::fmt::Display).
+//! The [Ranges] implementation also requires [Hash](std::hash::Hash) on the version type.
 //! For convenience, this library provides [SemanticVersion] that implements the basics of semantic versioning rules.
 //!
 //! # DependencyProvider trait

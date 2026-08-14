@@ -4,13 +4,53 @@
 //! to write a functional PubGrub algorithm.
 
 use std::collections::HashSet as Set;
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
 use crate::internal::{
     Arena, DecisionLevel, HashArena, Id, IncompDpId, IncompId, Incompatibility, PartialSolution,
     Relation, SatisfierSearch, SmallVec,
 };
-use crate::{DependencyProvider, DerivationTree, Map, NoSolutionError, VersionSet};
+use crate::{DependencyProvider, DerivationTree, Map, NoSolutionError, Package, VersionSet};
+
+#[derive(Clone)]
+struct MergedDependencies<P: Package, I> {
+    buckets: Map<DependencyKey<P>, SmallVec<I>>,
+}
+
+impl<P: Package, I> Default for MergedDependencies<P, I> {
+    fn default() -> Self {
+        Self {
+            buckets: Map::default(),
+        }
+    }
+}
+
+impl<P: Package, I> MergedDependencies<P, I> {
+    /// Return candidates with the same package pair and dependency-range hash.
+    fn bucket(
+        &mut self,
+        dependent: Id<P>,
+        dependency: Id<P>,
+        range: &impl Hash,
+    ) -> &mut SmallVec<I> {
+        let range_hash = self.buckets.hasher().hash_one(range);
+        self.buckets
+            .entry(DependencyKey {
+                dependent,
+                dependency,
+                range_hash,
+            })
+            .or_default()
+    }
+}
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct DependencyKey<P: Package> {
+    dependent: Id<P>,
+    dependency: Id<P>,
+    range_hash: u64,
+}
 
 /// Current state of the PubGrub algorithm.
 #[derive(Clone)]
@@ -27,10 +67,8 @@ pub(crate) struct State<DP: DependencyProvider> {
     /// These will stay contradicted until we have backtracked beyond its associated decision level.
     contradicted_incompatibilities: Map<IncompDpId<DP>, DecisionLevel>,
 
-    /// All incompatibilities expressing dependencies,
-    /// with common dependents merged.
-    #[allow(clippy::type_complexity)]
-    merged_dependencies: Map<(Id<DP::P>, Id<DP::P>), SmallVec<IncompDpId<DP>>>,
+    /// Dependency incompatibilities retained as candidates for merging.
+    merged_dependencies: MergedDependencies<DP::P, IncompDpId<DP>>,
 
     /// Partial solution.
     /// TODO: remove pub.
@@ -69,7 +107,7 @@ impl<DP: DependencyProvider> State<DP> {
             incompatibility_store,
             package_store,
             unit_propagation_buffer: SmallVec::Empty,
-            merged_dependencies: Map::default(),
+            merged_dependencies: MergedDependencies::default(),
         }
     }
 
@@ -340,8 +378,8 @@ impl<DP: DependencyProvider> State<DP> {
 
     /// Add this incompatibility into the set of all incompatibilities.
     ///
-    /// PubGrub collapses identical dependencies from adjacent package versions
-    /// into individual incompatibilities.
+    /// PubGrub collapses identical dependencies from different package versions into a single
+    /// incompatibility.
     /// This substantially reduces the total number of incompatibilities
     /// and makes it much easier for PubGrub to reason about multiple versions of packages at once.
     ///
@@ -354,25 +392,33 @@ impl<DP: DependencyProvider> State<DP> {
     /// We could collapse them into { foo (1.0.0 ∪ 1.1.0), not bar ^1.0.0 }
     /// without having to check the existence of other versions though.
     fn merge_incompatibility(&mut self, mut id: IncompDpId<DP>) {
-        if let Some((p1, p2)) = self.incompatibility_store[id].as_dependency() {
-            // If we are a dependency, there's a good chance we can be merged with a previous dependency
-            let deps_lookup = self.merged_dependencies.entry((p1, p2)).or_default();
-            if let Some((past, merged)) = deps_lookup.as_mut_slice().iter_mut().find_map(|past| {
-                self.incompatibility_store[id]
-                    .merge_dependents(&self.incompatibility_store[*past])
-                    .map(|m| (past, m))
-            }) {
-                let new = self.incompatibility_store.alloc(merged);
-                for (pkg, _) in self.incompatibility_store[new].iter() {
-                    self.incompatibilities
-                        .entry(pkg)
-                        .or_default()
-                        .retain(|id| id != past);
+        if let Some((dependent, dependency, dependency_range)) =
+            self.incompatibility_store[id].as_dependency()
+        {
+            // Self-dependencies cannot be merged.
+            if dependent != dependency {
+                let candidates =
+                    self.merged_dependencies
+                        .bucket(dependent, dependency, dependency_range);
+                if let Some((candidate, merged)) =
+                    candidates.as_mut_slice().iter_mut().find_map(|candidate| {
+                        self.incompatibility_store[id]
+                            .merge_dependents(&self.incompatibility_store[*candidate])
+                            .map(|merged| (candidate, merged))
+                    })
+                {
+                    let new = self.incompatibility_store.alloc(merged);
+                    for (pkg, _) in self.incompatibility_store[new].iter() {
+                        self.incompatibilities
+                            .entry(pkg)
+                            .or_default()
+                            .retain(|id| id != candidate);
+                    }
+                    *candidate = new;
+                    id = new;
+                } else {
+                    candidates.push(id);
                 }
-                *past = new;
-                id = new;
-            } else {
-                deps_lookup.push(id);
             }
         }
         for (pkg, term) in self.incompatibility_store[id].iter() {
@@ -421,5 +467,119 @@ impl<DP: DependencyProvider> State<DP> {
         }
         // Now the user can refer to the entire tree from its root.
         Arc::into_inner(precomputed.remove(&incompat).unwrap()).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod dependency_merge_tests {
+    use std::fmt::{self, Display};
+    use std::hash::{Hash, Hasher};
+
+    use crate::{OfflineDependencyProvider, Ranges, VersionSet};
+
+    use super::State;
+
+    #[test]
+    fn merge_dependencies_with_hash_collisions() {
+        let mut state: State<OfflineDependencyProvider<&str, CollidingRanges>> =
+            State::init("root", 0);
+        let package = state.package_store.alloc("package");
+
+        // Equal ranges recur non-adjacently. Each pair of unequal ranges shares a hash.
+        for version in 0..10 {
+            let first = if version % 2 == 0 { 0 } else { 10 };
+            state.add_incompatibility_from_dependencies(
+                package,
+                version,
+                [
+                    ("dependency", CollidingRanges::singleton(first)),
+                    ("dependency", CollidingRanges::singleton(first + 1)),
+                ],
+            );
+        }
+
+        let dependency = state.package_store.alloc("dependency");
+        let mut bucket_sizes = state
+            .merged_dependencies
+            .buckets
+            .values()
+            .map(|bucket| bucket.len())
+            .collect::<Vec<_>>();
+        bucket_sizes.sort_unstable();
+
+        assert_eq!(bucket_sizes, vec![2, 2]);
+        assert_eq!(state.incompatibilities[&package].len(), 4);
+        assert_eq!(state.incompatibilities[&dependency].len(), 4);
+    }
+
+    #[test]
+    fn self_dependencies_bypass_merge_index() {
+        let mut state: State<OfflineDependencyProvider<&str, Ranges<u32>>> = State::init("root", 0);
+        let package = state.package_store.alloc("package");
+
+        state.add_incompatibility_from_dependencies(package, 0, [("package", Ranges::full())]);
+
+        assert!(state.merged_dependencies.buckets.is_empty());
+    }
+
+    #[test]
+    fn merge_empty_dependency_ranges() {
+        let mut state: State<OfflineDependencyProvider<&str, Ranges<u32>>> = State::init("root", 0);
+        let package = state.package_store.alloc("package");
+
+        for version in 0..2 {
+            state.add_incompatibility_from_dependencies(
+                package,
+                version,
+                [("dependency", Ranges::empty())],
+            );
+        }
+
+        let dependency = state.package_store.alloc("dependency");
+        assert_eq!(state.merged_dependencies.buckets.len(), 1);
+
+        let bucket = state.merged_dependencies.buckets.values().next().unwrap();
+        assert_eq!(bucket.len(), 1);
+        assert_eq!(state.incompatibilities[&package].len(), 1);
+        assert!(!state.incompatibilities.contains_key(&dependency));
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct CollidingRanges(Ranges<u32>);
+
+    impl Display for CollidingRanges {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            Display::fmt(&self.0, f)
+        }
+    }
+
+    impl Hash for CollidingRanges {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            (self.0.contains(&10) || self.0.contains(&11)).hash(state);
+        }
+    }
+
+    impl VersionSet for CollidingRanges {
+        type V = u32;
+
+        fn empty() -> Self {
+            Self(Ranges::empty())
+        }
+
+        fn singleton(v: Self::V) -> Self {
+            Self(Ranges::singleton(v))
+        }
+
+        fn complement(&self) -> Self {
+            Self(self.0.complement())
+        }
+
+        fn intersection(&self, other: &Self) -> Self {
+            Self(self.0.intersection(&other.0))
+        }
+
+        fn contains(&self, v: &Self::V) -> bool {
+            self.0.contains(v)
+        }
     }
 }
