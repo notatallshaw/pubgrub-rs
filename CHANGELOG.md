@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Expose the existing optimized `Ranges` traversal through `VersionSet::contains_many` and use it to count matching versions in `OfflineDependencyProvider`.
+
 ## 0.6.1 - 2026-08-07
 
 ### Added
