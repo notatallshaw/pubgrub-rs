@@ -283,10 +283,14 @@ impl<V: Ord> Ranges<V> {
                     );
                 }
             }
+            let mut contained = false;
             while let Some(segment) = self.segments.get(*i) {
                 match within_bounds(v.borrow(), segment) {
-                    Ordering::Less => return Some(false),
-                    Ordering::Equal => return Some(true),
+                    Ordering::Less => break,
+                    Ordering::Equal => {
+                        contained = true;
+                        break;
+                    }
                     Ordering::Greater => *i += 1,
                 }
             }
@@ -294,7 +298,7 @@ impl<V: Ord> Ranges<V> {
             {
                 last = Some(v);
             }
-            Some(false)
+            Some(contained)
         })
     }
 
@@ -1058,10 +1062,14 @@ impl<V: Ord + Clone> Ranges<V> {
                     );
                 }
             }
+            let mut location = None;
             while let Some(segment) = self.segments.get(*i) {
                 match within_bounds(v.borrow(), segment) {
-                    Ordering::Less => return Some(None),
-                    Ordering::Equal => return Some(Some(*i)),
+                    Ordering::Less => break,
+                    Ordering::Equal => {
+                        location = Some(*i);
+                        break;
+                    }
                     Ordering::Greater => *i += 1,
                 }
             }
@@ -1069,7 +1077,7 @@ impl<V: Ord + Clone> Ranges<V> {
             {
                 last = Some(v);
             }
-            Some(None)
+            Some(location)
         });
         let mut kept_segments = group_adjacent_locations(version_locations).peekable();
 
@@ -1860,6 +1868,24 @@ pub mod tests {
             range.simplify(versions.iter()),
             range.simplify(versions.into_iter())
         );
+    }
+
+    /// The proptests sort their input before calling, so a descending pair is the only way to
+    /// reach the sortedness guard.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "`contains_many` `versions` argument incorrectly sorted")]
+    fn contains_many_rejects_unsorted() {
+        let range: Ranges<u32> = Ranges::between(1u32, 3u32).union(&Ranges::between(5u32, 7u32));
+        let _ = range.contains_many([5u32, 1u32].iter()).count();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "`simplify` `versions` argument incorrectly sorted")]
+    fn simplify_rejects_unsorted() {
+        let range: Ranges<u32> = Ranges::between(1u32, 3u32).union(&Ranges::between(5u32, 7u32));
+        let _ = range.simplify([5u32, 1u32].iter());
     }
 
     #[test]
